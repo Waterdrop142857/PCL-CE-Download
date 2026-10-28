@@ -1,0 +1,15 @@
+diff --git a/Plain Craft Launcher 2/Modules/Minecraft/RestrictedFeaturePolicy.cs b/Plain Craft Launcher 2/Modules/Minecraft/RestrictedFeaturePolicy.cs
+index 252e4bb..677e91f 100644
+--- a/Plain Craft Launcher 2/Modules/Minecraft/RestrictedFeaturePolicy.cs	
++++ b/Plain Craft Launcher 2/Modules/Minecraft/RestrictedFeaturePolicy.cs	
+@@ -6,7 +6,9 @@ namespace PCL;
+ 
+ internal static class RestrictedFeaturePolicy
+ {
+-    internal static RegionAssessment Assess() => RegionPolicy.Evaluate(RegionPolicy.ReadWindowsSignals());
++    // This fork permits these features regardless of Windows region settings.
++    internal static RegionAssessment Assess() =>
++        new(RegionClassification.Other, "fork-build-unrestricted");
+ 
+     internal static bool IsRestricted => Assess().IsRestricted;
+ 
