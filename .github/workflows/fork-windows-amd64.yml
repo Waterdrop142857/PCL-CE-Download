@@ -1,0 +1,216 @@
+# Fork-owned workflow: no dependency on upstream workflow files.
+name: Fork - Windows AMD64
+'on':
+  push:
+    branches:
+    - dev
+    paths-ignore:
+    - '**/*.md'
+    - .github/ISSUE_TEMPLATE/**
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: Release = stable; Beta = prerelease
+        required: true
+        default: Release
+        type: choice
+        options:
+        - Release
+        - Beta
+      publish_release:
+        description: Publish to GitHub Release (requires version)
+        required: true
+        default: false
+        type: boolean
+      version:
+        description: Release version, e.g. 2.15.1-fork.1; optional for build only
+        required: false
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: fork-amd64-${{ github.event_name }}-${{ github.ref }}-${{ inputs.version || 'build' }}
+  cancel-in-progress: false
+jobs:
+  prepare:
+    name: Prepare build and optional release
+    runs-on: ubuntu-latest
+    outputs:
+      configuration: ${{ steps.options.outputs.configuration }}
+      publish_release: ${{ steps.options.outputs.publish_release }}
+      tag: ${{ steps.options.outputs.tag }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        fetch-depth: 0
+    - name: Validate build and release options
+      id: options
+      env:
+        VERSION: ${{ inputs.version }}
+        BUILD_CONFIGURATION: ${{ inputs.configuration || 'Release' }}
+        PUBLISH_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release }}
+      run: |
+        python3 - <<'PYTHON'
+        import os
+        import re
+        import subprocess
+
+        configuration = os.environ["BUILD_CONFIGURATION"]
+        if configuration not in ("Release", "Beta"):
+            raise SystemExit("Only Release and Beta are supported")
+        publish = os.environ["PUBLISH_RELEASE"].lower() == "true"
+        tag = ""
+        if publish:
+            version = os.environ["VERSION"].strip()
+            if not re.fullmatch(r"v?[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?", version):
+                raise SystemExit("Publishing requires a version such as 2.15.1-fork.1")
+            tag = version if version.startswith("v") else "v" + version
+            head = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+            existing = subprocess.run(
+                ["git", "rev-parse", "--verify", "--quiet", f"refs/tags/{tag}^{{commit}}"],
+                text=True, capture_output=True,
+            )
+            if existing.returncode == 0 and existing.stdout.strip() != head:
+                raise SystemExit(f"Tag {tag} already points to a different commit; choose a new version")
+            if existing.returncode not in (0, 1):
+                raise SystemExit("Could not inspect the existing tag")
+            print(f"Release tag: {tag}; source commit: {head}")
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
+            stream.write(f"configuration={configuration}\n")
+            stream.write(f"publish_release={str(publish).lower()}\n")
+            stream.write(f"tag={tag}\n")
+        print(f"Build: Windows AMD64 / {configuration}; publish: {publish}")
+        PYTHON
+  build:
+    name: Windows AMD64
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      BUILD_CONFIGURATION: ${{ needs.prepare.outputs.configuration }}
+      BUILD_ARCHITECTURE: x64
+    steps:
+    - name: Configure Git line endings for patches
+      run: |
+        git config --global core.autocrlf false
+        git config --global core.eol lf
+    - name: Checkout
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+    - name: Validate build inputs
+      run: |
+        case "$BUILD_CONFIGURATION" in
+          Release|Beta) ;;
+          *) echo "Unsupported build configuration" >&2; exit 1 ;;
+        esac
+        if [ "$BUILD_ARCHITECTURE" != x64 ]; then
+          echo "This workflow only builds Windows AMD64 (x64 / win-x64)" >&2
+          exit 1
+        fi
+    - name: Remove region restriction before compilation
+      run: |
+        set -euo pipefail
+        patch_file=".github/patches/remove-region-restriction.patch"
+        git apply --check "$patch_file"
+        git apply "$patch_file"
+        git apply --reverse --check "$patch_file"
+        git diff --check
+        git diff -- "Plain Craft Launcher 2/Modules/Minecraft/RestrictedFeaturePolicy.cs"
+    - name: Setup .NET SDK
+      uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68
+      with:
+        dotnet-version: 10.0.x
+    - name: Publish Windows AMD64 application
+      env:
+        PCL_WRITE_SECRET: '1'
+        PCL_MS_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+        PCL_CURSEFORGE_API_KEY: ${{ secrets.CURSEFORGE_API_KEY }}
+        PCL_SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        PCL_NAID_CLIENT_ID: ${{ secrets.NAID_CLIENT_ID }}
+        PCL_NAID_CLIENT_SECRET: ${{ secrets.NAID_CLIENT_SECRET }}
+        PCL_LINK_SERVER_ROOT: ${{ secrets.LINK_SERVER_ROOTS }}
+        PCL_LOBBY_DEFAULT_SECRET: ${{ secrets.LOBBY_DEFAULT_SECRET }}
+        PCL_GITHUB_SHA: ${{ github.sha }}
+      run: |
+        dotnet publish "Plain Craft Launcher 2/Plain Craft Launcher 2.csproj" \
+          --configuration "$BUILD_CONFIGURATION" \
+          --runtime win-x64 \
+          --self-contained true \
+          -p:Platform=x64 \
+          -p:PublishSingleFile=true \
+          -p:IncludeNativeLibrariesForSelfExtract=true \
+          -p:DeleteExistingFiles=true \
+          --output ./artifact
+    - name: Verify Windows AMD64 executable
+      run: |
+        python - <<'PYTHON'
+        from pathlib import Path
+        import struct
+
+        path = Path("artifact/Plain Craft Launcher 2.exe")
+        with path.open("rb") as stream:
+            header = stream.read(64)
+            if len(header) != 64 or header[:2] != b"MZ":
+                raise SystemExit("Output is not a Windows executable")
+            pe_offset = struct.unpack_from("<I", header, 0x3C)[0]
+            stream.seek(pe_offset)
+            pe = stream.read(6)
+            if len(pe) != 6 or pe[:4] != b"PE\0\0":
+                raise SystemExit("Invalid PE signature")
+            machine = struct.unpack_from("<H", pe, 4)[0]
+            if machine != 0x8664:
+                raise SystemExit(f"Expected AMD64 (0x8664), got {machine:#06x}")
+        print(f"Verified Windows AMD64: {path}")
+        PYTHON
+    - name: Upload the Build Artifact
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: PCL2_CE_Fork_${{ needs.prepare.outputs.configuration }}_Windows_AMD64
+        path: artifact/**
+        if-no-files-found: error
+    needs: prepare
+  publish:
+    name: Publish Windows AMD64 to GitHub Release
+    needs:
+    - prepare
+    - build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - name: Download Build Artifact
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      with:
+        name: PCL2_CE_Fork_${{ needs.prepare.outputs.configuration }}_Windows_AMD64
+        path: artifact
+    - name: Prepare executable and SHA-256 checksum
+      env:
+        BUILD_CONFIGURATION: ${{ needs.prepare.outputs.configuration }}
+      run: |
+        set -euo pipefail
+        mkdir -p release
+        asset_name="PCL2_CE_Fork_${BUILD_CONFIGURATION}_Windows_AMD64.exe"
+        cp "artifact/Plain Craft Launcher 2.exe" "release/$asset_name"
+        cd release
+        sha256sum "$asset_name" > SHA256SUMS
+        sha256sum --check SHA256SUMS
+    - name: Create or update GitHub Release
+      uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        tag_name: ${{ needs.prepare.outputs.tag }}
+        target_commitish: ${{ github.sha }}
+        name: PCL CE Fork ${{ needs.prepare.outputs.tag }} (Windows AMD64)
+        draft: false
+        prerelease: ${{ needs.prepare.outputs.configuration == 'Beta' }}
+        generate_release_notes: true
+        body: |
+          Windows AMD64 (win-x64), self-contained single-file build.
+          Region restriction removed by this fork's build workflow.
+          Source commit: ${{ github.sha }}
+        fail_on_unmatched_files: true
+        files: |
+          release/*.exe
+          release/SHA256SUMS
+    if: ${{ needs.prepare.outputs.publish_release == 'true' }}
